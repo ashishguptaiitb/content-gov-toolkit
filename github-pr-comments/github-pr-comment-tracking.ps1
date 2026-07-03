@@ -55,8 +55,27 @@ foreach ($pr in $prNumbers) {
 
         # Append the command output exactly as returned by gh pr-comments.
         if ($result) {
-            $result | ForEach-Object { $_.ToString() } |
-                Out-File -FilePath $outputFile -Append -Encoding UTF8
+            # Normalize each output line so it remains a valid TSV row.
+            foreach ($line in $result) {
+
+            $cleanLine = $line.ToString()
+
+                # Replace embedded tabs with spaces.
+                $cleanLine = $cleanLine -replace "`t", " "
+
+                # Replace embedded CR/LF characters with spaces.
+                $cleanLine = $cleanLine -replace "`r", " "
+                $cleanLine = $cleanLine -replace "`n", " "
+
+                # Replace other ASCII control characters (except tab) with spaces.
+                $cleanLine = $cleanLine -replace "[\x00-\x08\x0B\x0C\x0E-\x1F]", " "
+
+                # Collapse repeated whitespace.
+                $cleanLine = $cleanLine -replace " {2,}", " "
+
+            $cleanLine |
+            Out-File -FilePath $outputFile -Append -Encoding UTF8
+}
 
         }
 
