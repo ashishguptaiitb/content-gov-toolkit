@@ -1,94 +1,134 @@
 <#
-Run "gh pr-comments" for every PR number listed in a text file and consolidates the output into a single TSV report.
+.SYNOPSIS
+Retrieves GitHub PR review comments for a list of pull requests and exports
+them to a consolidated TSV report.
 
-.INPUT required: Full path of the .txt file with one PR number per line.
-To generate the list of PRs, run:
-gh pr list --state closed --label "PendingFixes" --json number --jq ".[].number"
+.PREREQUISITES
+- GitHub CLI (gh) installed and authenticated.
+- ikawaha/gh-pr-comments extension installed.
 
-.OUTPUT is the file named PR_Comments_Report_<timestamp>.tsv
+Generate the PR list using:
+
+gh pr list --state closed --label "PendingFixes" --json number --jq ".[].number" > pr_numbers.txt
 #>
 
-# Prompt the user for the input file and accept paths with or without quotes.
+# Prompt for the PR list file.
 $inputFile = Read-Host "Enter the path to the PR number text file"
 $inputFile = $inputFile.Trim('"')
 
-# Verify that the specified file exists before continuing.
+# Verify the input file exists.
 if (-not (Test-Path $inputFile)) {
-    Write-Host "File not found: $inputFile" -ForegroundColor Red
+    Write-Host "Input file not found." -ForegroundColor Red
     exit 1
 }
 
-# Create a timestamped TSV report in the same folder as the input file.
+# Create the output file.
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $outputFile = Join-Path (Split-Path $inputFile -Parent) "PR_Comments_Report_$timestamp.tsv"
 
-# Add the header row to the output file.
-"File_Path`tLine`tAuthor`tStatus`tComment`tURL" |
-    Out-File -FilePath $outputFile -Encoding UTF8
-
-
-# Read the PR numbers, ignoring blank lines.
+# Read PR numbers.
 $prNumbers = Get-Content $inputFile |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+    ForEach-Object { $_.Trim() }
 
 $total = $prNumbers.Count
 $count = 0
 
-# Process each PR by running the GitHub CLI command and capturing its output.
+# Store output rows.
+$rows = New-Object System.Collections.Generic.List[object]
+
 foreach ($pr in $prNumbers) {
 
     $count++
-    Write-Host "[$count/$total] Processing PR $pr..."
+
+    Write-Progress `
+        -Activity "Retrieving PR comments" `
+        -Status "Processing PR $pr ($count of $total)" `
+        -PercentComplete (($count / $total) * 100)
 
     try {
 
-        # Execute the GitHub CLI command and capture standard output and errors.
-        $result = & gh pr-comments $pr 2>&1
+        # Execute the extension.
+        $jsonText = & gh pr-comments $pr --json 2>&1
 
-        # Record any command failures and continue with the next PR.
         if ($LASTEXITCODE -ne 0) {
-            ("ERROR processing PR {0}: {1}" -f $pr, ($result -join ' ')) |
-                Out-File -FilePath $outputFile -Append -Encoding UTF8
+            Write-Warning ("PR {0}: {1}" -f $pr, ($jsonText -join " "))
             continue
         }
 
-        # Append the command output exactly as returned by gh pr-comments.
-        if ($result) {
-            # Normalize each output line so it remains a valid TSV row.
-            foreach ($line in $result) {
+        if (-not $jsonText) {
+            continue
+        }
 
-            $cleanLine = $line.ToString()
+        $json = $jsonText | ConvertFrom-Json
 
-                # Replace embedded tabs with spaces.
-                $cleanLine = $cleanLine -replace "`t", " "
+        if (-not $json.ReviewThreads) {
+            continue
+        }
 
-                # Replace embedded CR/LF characters with spaces.
-                $cleanLine = $cleanLine -replace "`r", " "
-                $cleanLine = $cleanLine -replace "`n", " "
+        foreach ($thread in $json.ReviewThreads) {
 
-                # Replace other ASCII control characters (except tab) with spaces.
-                $cleanLine = $cleanLine -replace "[\x00-\x08\x0B\x0C\x0E-\x1F]", " "
+            foreach ($comment in $thread.Comments) {
 
-                # Collapse repeated whitespace.
-                $cleanLine = $cleanLine -replace " {2,}", " "
+                # Normalize only free-text fields.
+                $body = [string]$comment.Body
+                $body = $body -replace "`r`n"," "
+                $body = $body -replace "`r"," "
+                $body = $body -replace "`n"," "
+                $body = $body -replace "`t"," "
 
-            $cleanLine |
-            Out-File -FilePath $outputFile -Append -Encoding UTF8
-}
+                $rows.Add([PSCustomObject]@{
+
+                    PR_Number       = $pr
+
+                    File_Path       = $thread.Path
+                    Line            = $thread.Line
+                    Start_Line      = $thread.StartLine
+                    Diff_Side       = $thread.DiffSide
+
+                    Thread_Resolved = $thread.IsResolved
+                    Thread_Outdated = $thread.IsOutdated
+                    Resolved_By     = $thread.ResolvedBy
+
+                    Comment_ID      = $comment.ID
+                    Database_ID     = $comment.DatabaseID
+
+                    Author          = $comment.Author
+                    State           = $comment.State
+
+                    Created_At      = $comment.CreatedAt
+                    Updated_At      = $comment.UpdatedAt
+
+                    Comment         = $body
+
+                    URL             = $comment.URL
+
+                })
+
+            }
 
         }
 
     }
     catch {
-        # Capture unexpected errors without stopping the script.
-        ("ERROR processing PR {0}: {1}" -f $pr, $_.Exception.Message) |
-            Out-File -FilePath $outputFile -Append -Encoding UTF8
+
+        Write-Warning ("PR {0}: {1}" -f $pr, $_.Exception.Message)
+
     }
+
 }
 
-# Display the location of the generated report.
+Write-Progress -Activity "Retrieving PR comments" -Completed
+
+# Export as TSV.
+$rows |
+    Export-Csv `
+        -Path $outputFile `
+        -Delimiter "`t" `
+        -NoTypeInformation `
+        -Encoding UTF8
+
 Write-Host ""
-Write-Host "Done." -ForegroundColor Green
-Write-Host "Output saved to:"
+Write-Host "Completed successfully." -ForegroundColor Green
+Write-Host "Report saved to:"
 Write-Host $outputFile
